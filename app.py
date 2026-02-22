@@ -416,21 +416,17 @@ def run_cdd_research(client: Anthropic, subject: str, context: str, status_box):
             )
 
             if response.stop_reason == "end_turn":
-                progress.success("Research complete — building report…")
-                raw = next((b.text for b in response.content if b.type == "text"), "")
-                parsed = parse_report_json(raw)
-                if parsed is not None:
-                    return parsed, raw, audit_log, session_start
-
-                # Claude wrote a narrative instead of JSON — ask again explicitly
+                # end_turn is almost always a markdown narrative — always make a
+                # dedicated, tool-free call specifically for JSON output.
                 progress.info("Formatting structured report…")
                 messages.append({"role": "assistant", "content": response.content})
                 messages.append({
                     "role": "user",
                     "content": (
-                        "Your research is complete. Now produce the structured report.\n"
-                        "Output ONLY the JSON block — start with <CDD_REPORT_JSON> "
-                        "and end with </CDD_REPORT_JSON>. No other text before or after."
+                        "Research complete. Now output the report.\n"
+                        "Your entire response must be ONLY the JSON block below — "
+                        "nothing before it, nothing after it:\n\n"
+                        "<CDD_REPORT_JSON>\n{ … }\n</CDD_REPORT_JSON>"
                     ),
                 })
                 json_resp = client.messages.create(
@@ -438,11 +434,9 @@ def run_cdd_research(client: Anthropic, subject: str, context: str, status_box):
                     max_tokens=MAX_TOKENS,
                     system=SYSTEM_PROMPT,
                     messages=messages,
-                    # No tools — we only want text output here
                 )
-                raw2 = next((b.text for b in json_resp.content if b.type == "text"), raw)
-                parsed2 = parse_report_json(raw2)
-                return parsed2, raw2, audit_log, session_start
+                raw = next((b.text for b in json_resp.content if b.type == "text"), "")
+                return parse_report_json(raw), raw, audit_log, session_start
 
             if response.stop_reason == "tool_use":
                 messages.append({"role": "assistant", "content": response.content})
@@ -563,13 +557,23 @@ def parse_report_json(raw: str) -> dict | None:
         if result is not None:
             return result
 
-    # Strategy 2: Claude sometimes forgets the tags but still outputs valid JSON —
-    # find the outermost { … } block that contains "subject_name"
-    match2 = re.search(r'\{[^{}]*"subject_name".*\}', raw, re.DOTALL)
-    if match2:
-        result = _repair_and_parse(match2.group(0))
-        if result is not None:
-            return result
+    # Strategy 2: Claude sometimes forgets the tags — find the outermost { … }
+    # that contains "subject_name" using proper brace-depth tracking.
+    anchor = raw.find('"subject_name"')
+    if anchor >= 0:
+        start = raw.rfind("{", 0, anchor)
+        if start >= 0:
+            depth = 0
+            for i, ch in enumerate(raw[start:], start):
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        result = _repair_and_parse(raw[start : i + 1])
+                        if result is not None:
+                            return result
+                        break
 
     return None
 
