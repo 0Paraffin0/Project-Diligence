@@ -418,24 +418,28 @@ def run_cdd_research(client: Anthropic, subject: str, context: str, status_box):
             if response.stop_reason == "end_turn":
                 # end_turn is almost always a markdown narrative — always make a
                 # dedicated, tool-free call specifically for JSON output.
+                # Use a fresh minimal messages array (no tool_use/tool_result blocks)
+                # to avoid BadRequestError and context-window overflow.
                 progress.info("Formatting structured report…")
-                messages.append({"role": "assistant", "content": response.content})
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "Research complete. Now output the report.\n"
-                        "Your entire response must be ONLY the JSON block below — "
-                        "nothing before it, nothing after it:\n\n"
-                        "<CDD_REPORT_JSON>\n{ … }\n</CDD_REPORT_JSON>"
-                    ),
-                })
+                narrative = next(
+                    (b.text for b in response.content if b.type == "text"), ""
+                )
                 json_resp = client.messages.create(
                     model=MODEL,
                     max_tokens=MAX_TOKENS,
                     system=SYSTEM_PROMPT,
-                    tools=TOOLS,
-                    tool_choice={"type": "none"},
-                    messages=messages,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": (
+                                "Research summary:\n\n"
+                                + narrative
+                                + "\n\nUsing the research above, output the full CDD "
+                                "report as a single JSON block — nothing else:\n"
+                                "<CDD_REPORT_JSON>\n{ … }\n</CDD_REPORT_JSON>"
+                            ),
+                        }
+                    ],
                 )
                 raw = next((b.text for b in json_resp.content if b.type == "text"), "")
                 return parse_report_json(raw), raw, audit_log, session_start
@@ -497,23 +501,22 @@ def run_cdd_research(client: Anthropic, subject: str, context: str, status_box):
         raw = next((b.text for b in response.content if b.type == "text"), "")
         parsed = parse_report_json(raw)
         if parsed is None:
-            # Attempt JSON extraction even from a non-end_turn response
-            messages.append({"role": "assistant", "content": response.content})
-            messages.append({
-                "role": "user",
-                "content": (
-                    "Your research is complete. Now produce the structured report.\n"
-                    "Output ONLY the JSON block — start with <CDD_REPORT_JSON> "
-                    "and end with </CDD_REPORT_JSON>. No other text before or after."
-                ),
-            })
             json_resp = client.messages.create(
                 model=MODEL,
                 max_tokens=MAX_TOKENS,
                 system=SYSTEM_PROMPT,
-                tools=TOOLS,
-                tool_choice={"type": "none"},
-                messages=messages,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": (
+                            "Research summary:\n\n"
+                            + raw
+                            + "\n\nUsing the research above, output the full CDD "
+                            "report as a single JSON block — nothing else:\n"
+                            "<CDD_REPORT_JSON>\n{ … }\n</CDD_REPORT_JSON>"
+                        ),
+                    }
+                ],
             )
             raw = next((b.text for b in json_resp.content if b.type == "text"), raw)
             parsed = parse_report_json(raw)
