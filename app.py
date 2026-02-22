@@ -433,6 +433,8 @@ def run_cdd_research(client: Anthropic, subject: str, context: str, status_box):
                     model=MODEL,
                     max_tokens=MAX_TOKENS,
                     system=SYSTEM_PROMPT,
+                    tools=TOOLS,
+                    tool_choice={"type": "none"},
                     messages=messages,
                 )
                 raw = next((b.text for b in json_resp.content if b.type == "text"), "")
@@ -509,6 +511,8 @@ def run_cdd_research(client: Anthropic, subject: str, context: str, status_box):
                 model=MODEL,
                 max_tokens=MAX_TOKENS,
                 system=SYSTEM_PROMPT,
+                tools=TOOLS,
+                tool_choice={"type": "none"},
                 messages=messages,
             )
             raw = next((b.text for b in json_resp.content if b.type == "text"), raw)
