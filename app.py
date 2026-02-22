@@ -1,87 +1,82 @@
 """
 CDD Assistant — AI-Powered Customer Due Diligence Tool
-For financial crime compliance analysts at law firms.
-
-Setup:
-    1. pip install -r requirements.txt
-    2. Copy .env.example to .env and add your ANTHROPIC_API_KEY
-    3. streamlit run app.py
+Automatically researches customers via web search and produces
+a structured CDD report ready for analyst review.
 """
 
-import base64
 import os
 
 import streamlit as st
 from anthropic import Anthropic
+from duckduckgo_search import DDGS
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── Constants ──────────────────────────────────────────────────────────────────
-
 MODEL = "claude-opus-4-6"
 MAX_TOKENS = 16000
+MAX_SEARCHES = 10  # cap to prevent runaway loops
 
 SYSTEM_PROMPT = """\
-You are an expert financial crime compliance assistant specialising in Customer Due Diligence (CDD). \
-You support financial crime analysts in conducting thorough, accurate, and regulation-aligned CDD reviews. \
-Your role is to assist — not replace — analyst judgment. All outputs you produce must be reviewed and \
-approved by a qualified analyst before any onboarding decision is made.
+You are an expert financial crime compliance assistant specialising in Customer Due Diligence (CDD).
 
-When assisting with a CDD review, follow this structured process:
+You have access to a web_search tool. When given a customer to review, proactively search the \
+internet to gather information across all relevant CDD risk areas before writing your report.
 
-**1. Customer Identification**
-Extract and summarise all identifying information provided for the customer. Flag any missing fields \
-that are required for KYC purposes (e.g., full name, date of birth, ID document, company registration number).
+Run multiple targeted searches — at minimum cover:
+- Company or individual registration and ownership structure
+- Sanctions exposure (OFAC, UN, EU, HMT)
+- PEP (Politically Exposed Person) status
+- Adverse media: fraud, money laundering, bribery, regulatory actions
+- General background and business activities
 
-**2. Identity Verification**
-Review the documents provided. Highlight any inconsistencies, expired documents, or gaps in verification. \
-Note what has been verified and what remains outstanding.
+After completing your research, produce a structured report with all 10 sections:
 
-**3. Beneficial Ownership**
-Identify and map all beneficial owners holding 25% or more of the entity (or as defined by the applicable \
-regulatory threshold). Flag any complex, opaque, or offshore ownership structures that require further investigation.
-
-**4. Business Relationship Purpose**
-Summarise the stated purpose of the relationship, expected transaction volumes, and source of funds or wealth. \
-Flag if this information is vague, incomplete, or inconsistent with the customer's profile.
-
-**5. Risk Assessment**
-Assign a preliminary risk rating (Low / Medium / High) based on the following factors: geographic risk, \
-industry/sector risk, PEP status, sanctions exposure, ownership complexity, and adverse media. Clearly state \
-the evidence behind each risk factor identified. Do not assign a final rating — present your analysis for the \
-analyst to validate.
-
-**6. Sanctions and PEP Screening**
-Identify whether the customer, beneficial owners, or key controllers appear on any major sanctions lists \
-(UN, OFAC, EU, HMT) or are classified as Politically Exposed Persons. Flag any potential matches with \
-supporting detail.
-
-**7. Adverse Media**
-Summarise any relevant negative news, regulatory actions, legal proceedings, or financial crime associations \
-found. Distinguish between confirmed findings and unverified allegations.
-
-**8. Enhanced Due Diligence Triggers**
-If any high-risk indicators are present, recommend that Enhanced Due Diligence be conducted and specify \
-what additional steps or documentation should be obtained.
-
-**9. CDD Case Narrative**
-Draft a structured case narrative that summarises: who the customer is, what risk factors were identified, \
-how each was assessed or mitigated, and a recommended decision (Approve / Decline / Escalate for further \
-review). Clearly label this as a draft pending analyst review.
-
-**10. Ongoing Monitoring Notes**
-Based on the risk profile, recommend a review frequency and note any specific transaction types or \
-behaviours that should be monitored going forward.
+1. Customer Identification — summarise known identifying details; flag missing KYC fields
+2. Identity Verification — note what has been verified and what is outstanding
+3. Beneficial Ownership — map owners above 25% threshold; flag complex or offshore structures
+4. Business Relationship Purpose — summarise stated purpose, expected volumes, source of funds
+5. Risk Assessment — preliminary rating (Low / Medium / High) with evidence; do not finalise
+6. Sanctions and PEP Screening — flag any list matches with supporting detail
+7. Adverse Media — summarise findings; distinguish confirmed facts from unverified allegations
+8. Enhanced Due Diligence Triggers — recommend EDD steps if high-risk indicators are present
+9. CDD Case Narrative — draft summary and recommended decision (Approve / Decline / Escalate)
+10. Ongoing Monitoring Notes — recommended review frequency and behaviours to monitor
 
 Behavioural guidelines:
-- Always cite the source of your findings (e.g., document provided, public registry, screening result).
-- If information is insufficient to complete a section, clearly state what is missing and why it matters.
-- Never fabricate data, infer ownership without evidence, or present assumptions as facts.
-- Flag anything unusual, inconsistent, or potentially high-risk rather than smoothing it over.
+- Cite the source URL for every finding.
+- Clearly state when a search returned no relevant results.
+- Never fabricate data or infer ownership without evidence.
+- Flag anything unusual or potentially high-risk.
 - Use plain, professional language suitable for a compliance case file.
-- Always remind the analyst that your output is a draft and that final decisions are their responsibility.\
+- Label the full report as a DRAFT pending analyst review.
+- Always remind the analyst that final decisions are their responsibility.\
 """
+
+TOOLS = [
+    {
+        "name": "web_search",
+        "description": (
+            "Search the internet for information relevant to a CDD review. "
+            "Run multiple specific searches to cover sanctions lists, adverse media, "
+            "corporate registry data, PEP status, and general background. "
+            "Each call should focus on one specific aspect."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "A specific search query, e.g. 'Acme Holdings BVI company registry', "
+                        "'John Smith OFAC sanctions', 'Meridian Trading fraud news 2024'"
+                    ),
+                }
+            },
+            "required": ["query"],
+        },
+    }
+]
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -101,91 +96,98 @@ def get_client() -> Anthropic:
     return Anthropic(api_key=api_key)
 
 
+def run_web_search(query: str, max_results: int = 5) -> str:
+    """Execute a DuckDuckGo search and return formatted results."""
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=max_results))
+        if not results:
+            return "No results found for this query."
+        parts = []
+        for r in results:
+            parts.append(
+                f"Title: {r.get('title', 'N/A')}\n"
+                f"URL: {r.get('href', 'N/A')}\n"
+                f"Snippet: {r.get('body', 'N/A')}"
+            )
+        return "\n\n".join(parts)
+    except Exception as exc:
+        return f"Search error: {exc}"
+
+
+def run_cdd_research(client: Anthropic, customer_details: str, status_box):
+    """
+    Agentic loop: Claude decides what to search, we execute,
+    Claude synthesises results into a CDD report.
+    Returns (report_text, list_of_queries).
+    """
+    messages = [{"role": "user", "content": customer_details}]
+    search_count = 0
+    searches_done = []
+
+    with status_box:
+        progress = st.empty()
+        log = st.empty()
+
+        while search_count <= MAX_SEARCHES:
+            progress.info("Thinking about what to research…")
+
+            response = client.messages.create(
+                model=MODEL,
+                max_tokens=MAX_TOKENS,
+                system=SYSTEM_PROMPT,
+                tools=TOOLS,
+                messages=messages,
+            )
+
+            if response.stop_reason == "end_turn":
+                progress.success("Research complete — report ready.")
+                report = next(
+                    (b.text for b in response.content if b.type == "text"), ""
+                )
+                return report, searches_done
+
+            if response.stop_reason == "tool_use":
+                messages.append({"role": "assistant", "content": response.content})
+                tool_results = []
+
+                for block in response.content:
+                    if block.type == "tool_use" and block.name == "web_search":
+                        query = block.input["query"]
+                        search_count += 1
+                        searches_done.append(query)
+                        progress.info(f"Searching ({search_count}): *{query}*")
+                        log.markdown(
+                            "**Searches so far:**\n"
+                            + "\n".join(f"- {q}" for q in searches_done)
+                        )
+                        result = run_web_search(query)
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": result,
+                        })
+
+                messages.append({"role": "user", "content": tool_results})
+            else:
+                break
+
+        # Fallback if loop exits without end_turn
+        report = next(
+            (b.text for b in response.content if b.type == "text"),
+            "Research reached the search limit. Please review findings above.",
+        )
+        return report, searches_done
+
+
 def init_session_state():
-    """Initialise Streamlit session state variables."""
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-
-
-def encode_file(uploaded_file) -> tuple[str, str]:
-    """Read an uploaded file and return (base64_encoded_string, mime_type)."""
-    raw = uploaded_file.read()
-    return base64.standard_b64encode(raw).decode("utf-8"), uploaded_file.type
-
-
-def build_api_content(text: str, attachments: list) -> list | str:
-    """
-    Build the content field for an API message.
-    Returns a plain string when there are no attachments,
-    or a list of typed content blocks when attachments are present.
-    """
-    if not attachments:
-        return text
-
-    blocks = []
-    for name, b64_data, mime in attachments:
-        if mime == "application/pdf":
-            blocks.append({
-                "type": "document",
-                "source": {
-                    "type": "base64",
-                    "media_type": "application/pdf",
-                    "data": b64_data,
-                },
-                "title": name,
-            })
-        elif mime.startswith("image/"):
-            blocks.append({
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": mime,
-                    "data": b64_data,
-                },
-            })
-
-    blocks.append({"type": "text", "text": text})
-    return blocks
-
-
-def render_message_content(content):
-    """Display a stored message's content in the Streamlit UI."""
-    if isinstance(content, str):
-        st.markdown(content)
-        return
-
-    for block in content:
-        btype = block.get("type")
-        if btype == "text":
-            st.markdown(block["text"])
-        elif btype == "document":
-            st.caption(f"📄 *{block.get('title', 'Document')}* attached")
-        elif btype == "image":
-            st.caption("🖼️ Image attached")
-
-
-def export_conversation() -> str:
-    """Serialise the conversation history as plain text for download."""
-    parts = []
-    for msg in st.session_state.messages:
-        label = "ANALYST" if msg["role"] == "user" else "CDD ASSISTANT"
-        content = msg["content"]
-        if isinstance(content, str):
-            body = content
-        elif isinstance(content, list):
-            text_parts = []
-            for block in content:
-                if block.get("type") == "text":
-                    text_parts.append(block["text"])
-                else:
-                    text_parts.append(
-                        f"[{block.get('title', block.get('type', 'attachment'))}]"
-                    )
-            body = "\n".join(text_parts)
-        else:
-            body = str(content)
-        parts.append(f"{'─' * 60}\n{label}\n{'─' * 60}\n{body}")
-    return "\n\n".join(parts)
+    for key, default in [
+        ("report", None),
+        ("searches", []),
+        ("follow_ups", []),
+    ]:
+        if key not in st.session_state:
+            st.session_state[key] = default
 
 
 # ── Main App ───────────────────────────────────────────────────────────────────
@@ -207,29 +209,15 @@ def main():
         st.caption("AI-Assisted Customer Due Diligence")
         st.divider()
 
-        with st.expander("📖 How to use this tool", expanded=True):
+        with st.expander("📖 How to use", expanded=True):
             st.markdown(
                 """
-                **Step 1 — Describe the customer**
-                In the chat, tell the assistant who the customer is:
-                - Individual or company?
-                - Country of incorporation / residence
-                - Nature of the business relationship
-                - Source of funds or wealth (if known)
-
-                **Step 2 — Attach documents** *(optional)*
-                Upload passports, corporate certificates, ownership charts,
-                or other KYC documents below. They will be sent with your
-                next message.
-
-                **Step 3 — Review AI output**
-                The assistant works through each CDD step. Ask follow-up
-                questions or request a full case narrative at any time.
-
-                **Step 4 — Export**
-                Download the full conversation as a text file to include
-                in your case file.
-
+                1. Enter the customer name and any known details
+                2. Click **Run CDD Review** — the AI automatically searches
+                   the internet across all key risk areas
+                3. Review the generated report
+                4. Use the chat at the bottom for follow-up questions
+                5. Download the report for your case file
                 ---
                 ⚠️ All outputs are drafts. Final decisions remain
                 the analyst's responsibility.
@@ -238,37 +226,20 @@ def main():
 
         st.divider()
 
-        st.markdown("**📎 Attach Documents**")
-        uploaded_files = st.file_uploader(
-            "Upload KYC documents",
-            type=["pdf", "png", "jpg", "jpeg"],
-            accept_multiple_files=True,
-            help=(
-                "Supported formats: PDF, PNG, JPG. "
-                "Documents are sent with your next message."
-            ),
-            label_visibility="collapsed",
-        )
-        if uploaded_files:
-            for f in uploaded_files:
-                st.caption(f"✅ {f.name}")
-
-        st.divider()
-
-        btn_col1, btn_col2 = st.columns(2)
-        with btn_col1:
-            if st.button("🗑️ New Case", use_container_width=True, type="secondary"):
-                st.session_state.messages = []
+        if st.session_state.report:
+            if st.button("🗑️ New Review", use_container_width=True, type="secondary"):
+                st.session_state.report = None
+                st.session_state.searches = []
+                st.session_state.follow_ups = []
                 st.rerun()
-        with btn_col2:
-            if st.session_state.messages:
-                st.download_button(
-                    label="💾 Export",
-                    data=export_conversation(),
-                    file_name="cdd_review.txt",
-                    mime="text/plain",
-                    use_container_width=True,
-                )
+
+            st.download_button(
+                label="💾 Download Report",
+                data=st.session_state.report,
+                file_name="cdd_report.txt",
+                mime="text/plain",
+                use_container_width=True,
+            )
 
         st.divider()
         st.warning(
@@ -279,72 +250,105 @@ def main():
 
     # ── Main panel ─────────────────────────────────────────────────────────────
     st.markdown("## Customer Due Diligence Review")
-    st.markdown(
-        "Describe the customer and attach any relevant documents. "
-        "The assistant will work through each CDD step and flag areas of concern."
-    )
 
-    if not st.session_state.messages:
-        st.info(
-            "💡 **Example prompt to get started:**\n\n"
-            "*\"Please begin a CDD review for a new client: Meridian Trading Ltd, "
-            "incorporated in the British Virgin Islands. The relationship purpose is "
-            "trade finance, with an expected monthly transaction volume of USD 500,000. "
-            "The director is John Smith (British national). I've attached the certificate "
-            "of incorporation and Mr Smith's passport.\"*"
+    # ── Input form (shown until a report exists) ───────────────────────────────
+    if not st.session_state.report:
+        st.markdown(
+            "Enter the customer's name and any known details. "
+            "The AI will search the internet and produce a full CDD report automatically."
         )
 
-    # Render existing conversation history
-    for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]):
-            render_message_content(msg["content"])
+        with st.form("cdd_form"):
+            customer_input = st.text_area(
+                "Customer details",
+                placeholder=(
+                    "Example:\n"
+                    "Company: Meridian Trading Ltd\n"
+                    "Incorporated: British Virgin Islands\n"
+                    "Director: John Smith (British national)\n"
+                    "Relationship purpose: Trade finance\n"
+                    "Expected monthly volume: USD 500,000"
+                ),
+                height=160,
+                label_visibility="collapsed",
+            )
+            submitted = st.form_submit_button(
+                "🔍 Run CDD Review", use_container_width=True, type="primary"
+            )
 
-    # ── Chat input ─────────────────────────────────────────────────────────────
-    if prompt := st.chat_input("Describe the customer or ask a follow-up question…"):
+        if submitted and customer_input.strip():
+            status_box = st.container()
+            report, searches = run_cdd_research(client, customer_input, status_box)
+            st.session_state.report = report
+            st.session_state.searches = searches
+            st.rerun()
+        elif submitted:
+            st.warning("Please enter some customer details before running the review.")
 
-        # Encode any attached files
-        attachments = []
-        if uploaded_files:
-            for f in uploaded_files:
-                f.seek(0)
-                b64, mime = encode_file(f)
-                attachments.append((f.name, b64, mime))
+    # ── Report display ─────────────────────────────────────────────────────────
+    if st.session_state.report:
+        if st.session_state.searches:
+            with st.expander(
+                f"🔍 {len(st.session_state.searches)} web searches performed",
+                expanded=False,
+            ):
+                for q in st.session_state.searches:
+                    st.markdown(f"- {q}")
 
-        user_content = build_api_content(prompt, attachments)
+        st.divider()
+        st.markdown(st.session_state.report)
+        st.divider()
 
-        # Store and display the user message
-        st.session_state.messages.append({"role": "user", "content": user_content})
-        with st.chat_message("user"):
-            render_message_content(user_content)
-
-        # Stream Claude's response
-        with st.chat_message("assistant"):
-            response_box = st.empty()
-            full_response = ""
-
-            try:
-                with client.messages.stream(
-                    model=MODEL,
-                    max_tokens=MAX_TOKENS,
-                    system=SYSTEM_PROMPT,
-                    thinking={"type": "adaptive"},
-                    messages=st.session_state.messages,
-                ) as stream:
-                    for text_chunk in stream.text_stream:
-                        full_response += text_chunk
-                        response_box.markdown(full_response + "▌")
-
-                response_box.markdown(full_response)
-
-            except Exception as exc:
-                st.error(f"Something went wrong: {exc}")
-                # Remove the incomplete user message to keep conversation valid
-                st.session_state.messages.pop()
-                st.stop()
-
-        st.session_state.messages.append(
-            {"role": "assistant", "content": full_response}
+        # ── Follow-up chat ─────────────────────────────────────────────────────
+        st.markdown("### 💬 Follow-up Questions")
+        st.caption(
+            "Ask the assistant to clarify, expand on, or investigate any part of the report."
         )
+
+        for msg in st.session_state.follow_ups:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+
+        if prompt := st.chat_input("Ask a follow-up question…"):
+            st.session_state.follow_ups.append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
+
+            # Give the model the report as context for follow-ups
+            context = [
+                {
+                    "role": "user",
+                    "content": f"The following CDD report was generated:\n\n{st.session_state.report}",
+                },
+                {
+                    "role": "assistant",
+                    "content": "Understood. I have reviewed the CDD report. What follow-up questions do you have?",
+                },
+            ] + st.session_state.follow_ups
+
+            with st.chat_message("assistant"):
+                box = st.empty()
+                full_response = ""
+                try:
+                    with client.messages.stream(
+                        model=MODEL,
+                        max_tokens=MAX_TOKENS,
+                        system=SYSTEM_PROMPT,
+                        thinking={"type": "adaptive"},
+                        messages=context,
+                    ) as stream:
+                        for chunk in stream.text_stream:
+                            full_response += chunk
+                            box.markdown(full_response + "▌")
+                    box.markdown(full_response)
+                except Exception as exc:
+                    st.error(f"Error: {exc}")
+                    st.session_state.follow_ups.pop()
+                    st.stop()
+
+            st.session_state.follow_ups.append(
+                {"role": "assistant", "content": full_response}
+            )
 
 
 if __name__ == "__main__":
