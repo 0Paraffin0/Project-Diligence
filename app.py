@@ -418,7 +418,31 @@ def run_cdd_research(client: Anthropic, subject: str, context: str, status_box):
             if response.stop_reason == "end_turn":
                 progress.success("Research complete — building report…")
                 raw = next((b.text for b in response.content if b.type == "text"), "")
-                return parse_report_json(raw), raw, audit_log, session_start
+                parsed = parse_report_json(raw)
+                if parsed is not None:
+                    return parsed, raw, audit_log, session_start
+
+                # Claude wrote a narrative instead of JSON — ask again explicitly
+                progress.info("Formatting structured report…")
+                messages.append({"role": "assistant", "content": response.content})
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Your research is complete. Now produce the structured report.\n"
+                        "Output ONLY the JSON block — start with <CDD_REPORT_JSON> "
+                        "and end with </CDD_REPORT_JSON>. No other text before or after."
+                    ),
+                })
+                json_resp = client.messages.create(
+                    model=MODEL,
+                    max_tokens=MAX_TOKENS,
+                    system=SYSTEM_PROMPT,
+                    messages=messages,
+                    # No tools — we only want text output here
+                )
+                raw2 = next((b.text for b in json_resp.content if b.type == "text"), raw)
+                parsed2 = parse_report_json(raw2)
+                return parsed2, raw2, audit_log, session_start
 
             if response.stop_reason == "tool_use":
                 messages.append({"role": "assistant", "content": response.content})
@@ -475,22 +499,79 @@ def run_cdd_research(client: Anthropic, subject: str, context: str, status_box):
                 break
 
         raw = next((b.text for b in response.content if b.type == "text"), "")
-        return parse_report_json(raw), raw, audit_log, session_start
+        parsed = parse_report_json(raw)
+        if parsed is None:
+            # Attempt JSON extraction even from a non-end_turn response
+            messages.append({"role": "assistant", "content": response.content})
+            messages.append({
+                "role": "user",
+                "content": (
+                    "Your research is complete. Now produce the structured report.\n"
+                    "Output ONLY the JSON block — start with <CDD_REPORT_JSON> "
+                    "and end with </CDD_REPORT_JSON>. No other text before or after."
+                ),
+            })
+            json_resp = client.messages.create(
+                model=MODEL,
+                max_tokens=MAX_TOKENS,
+                system=SYSTEM_PROMPT,
+                messages=messages,
+            )
+            raw = next((b.text for b in json_resp.content if b.type == "text"), raw)
+            parsed = parse_report_json(raw)
+        return parsed, raw, audit_log, session_start
 
 
 # ── JSON extraction / parsing ──────────────────────────────────────────────────
 
-def parse_report_json(raw: str) -> dict | None:
-    match = re.search(r"<CDD_REPORT_JSON>(.*?)</CDD_REPORT_JSON>", raw, re.DOTALL)
-    if not match:
-        return None
-    blob = match.group(1).strip()
-    # Repair common Claude JSON quirks: trailing commas before ] or }
-    blob = re.sub(r",\s*([}\]])", r"\1", blob)
+def _repair_and_parse(blob: str) -> dict | None:
+    """Try progressively more aggressive repairs before giving up."""
+    blob = blob.strip()
+    # Strip markdown code fences that Claude sometimes wraps JSON in
+    blob = re.sub(r"^```(?:json)?\s*", "", blob)
+    blob = re.sub(r"\s*```$", "", blob)
+    blob = blob.strip()
+
+    # Pass 1 — raw
     try:
         return json.loads(blob)
     except json.JSONDecodeError:
-        return None
+        pass
+
+    # Pass 2 — remove trailing commas before } or ]
+    blob2 = re.sub(r",\s*([}\]])", r"\1", blob)
+    try:
+        return json.loads(blob2)
+    except json.JSONDecodeError:
+        pass
+
+    # Pass 3 — also collapse literal \n / \t that sometimes appear unescaped
+    blob3 = re.sub(r"(?<!\\)\n", " ", blob2)
+    try:
+        return json.loads(blob3)
+    except json.JSONDecodeError:
+        pass
+
+    return None
+
+
+def parse_report_json(raw: str) -> dict | None:
+    # Strategy 1: look for the expected XML tags
+    match = re.search(r"<CDD_REPORT_JSON>(.*?)</CDD_REPORT_JSON>", raw, re.DOTALL)
+    if match:
+        result = _repair_and_parse(match.group(1))
+        if result is not None:
+            return result
+
+    # Strategy 2: Claude sometimes forgets the tags but still outputs valid JSON —
+    # find the outermost { … } block that contains "subject_name"
+    match2 = re.search(r'\{[^{}]*"subject_name".*\}', raw, re.DOTALL)
+    if match2:
+        result = _repair_and_parse(match2.group(0))
+        if result is not None:
+            return result
+
+    return None
 
 
 # ── CSS ────────────────────────────────────────────────────────────────────────
