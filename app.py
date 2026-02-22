@@ -1,7 +1,7 @@
 """
 CDD Assistant — AI-Powered Customer Due Diligence Tool
-Automatically researches customers via Dow Jones Risk & Compliance and
-web search, producing a structured CDD report ready for analyst review.
+Automatically researches customers via OpenSanctions and web search,
+producing a structured CDD report ready for analyst review.
 """
 
 import os
@@ -19,41 +19,30 @@ MODEL = "claude-opus-4-6"
 MAX_TOKENS = 16000
 MAX_TOOL_CALLS = 25  # cap to prevent runaway loops
 
-# ── Dow Jones R&C config ────────────────────────────────────────────────────────
-DJ_TOKEN_URL = "https://accounts.dowjones.com/oauth2/v1/token"
-DJ_SCREEN_URL = "https://api.dowjones.com/risk/v1/profiles/search"
-
-# Categories to request from the DJ R&C API
-DJ_CATEGORIES = [
-    "b_peps",   # Politically Exposed Persons
-    "b_soe",    # State-Owned Enterprises
-    "e_sl",     # Sanctions lists (all)
-    "b_am",     # Adverse media
-    "b_oel",    # Other enforcement lists
-]
+# OpenSanctions free public API — no account needed
+OPENSANCTIONS_URL = "https://api.opensanctions.org/search/default"
 
 SYSTEM_PROMPT = """\
 You are an expert financial crime compliance assistant specialising in Customer Due Diligence (CDD).
 
-You have three research tools: dow_jones_screen, web_search, and fetch_webpage.
+You have three research tools: sanctions_screen, web_search, and fetch_webpage.
 
-STEP 1 — ALWAYS run dow_jones_screen first. This is the primary professional screening \
-database covering PEP lists, global sanctions lists (OFAC SDN, UN, EU, HMT and 1,000+ others), \
-state-owned enterprises, and adverse media. Review every match carefully and note the exact \
-categories, listing reasons, and dates returned.
+STEP 1 — ALWAYS call sanctions_screen first. This queries the OpenSanctions database, which \
+aggregates 100+ global sanctions lists (OFAC SDN, UN, EU, HMT, DFAT, SECO, and more) plus \
+PEP data and enforcement actions — the same underlying data used by professional screening \
+platforms. Run it for the entity name, and separately for any key individuals (directors, UBOs).
 
-STEP 2 — Supplement with web_search. Even if dow_jones_screen returns results, run targeted \
-web searches to find:
-- Company registration and ownership structure (Companies House, national registries)
-- Any adverse media not captured in the DJ database (recent news, local publications)
-- Beneficial ownership and UBO details
-- Business background, clients, revenue, sector
-- Corroboration or further detail on any DJ matches found
+STEP 2 — Supplement with web_search. Run targeted searches to find:
+- Company registration, incorporation details, directors, and registered address
+- Beneficial ownership structure and UBO identities
+- Adverse media: fraud, money laundering, bribery, regulatory actions, criminal investigations
+- Business background, sector, clients, and revenues
+- Corroboration or further detail on any screening matches found
+- Country-specific risk intelligence (FATF grey/black list status, corruption indices)
 
-STEP 3 — For the most relevant URLs from your searches, call fetch_webpage to read full \
-page content rather than relying on snippets.
+STEP 3 — For the most relevant URLs, call fetch_webpage to read the full page content.
 
-Run AT LEAST 10 total tool calls before writing the report.
+Run AT LEAST 12 total tool calls before writing the report.
 
 ────────────────────────────────────────────────────────────────────────
 REPORT REQUIREMENTS — every section must be specific and evidence-based.
@@ -61,81 +50,77 @@ REPORT REQUIREMENTS — every section must be specific and evidence-based.
 
 **1. Customer Identification**
 List every piece of identifying information found: full legal name, registration number, \
-registered address, incorporation date, jurisdiction, directors/officers, company type, \
-LEI if available. Flag each KYC field that is missing and state exactly why it is required.
+registered address, incorporation date, jurisdiction, directors/officers, company type. \
+Flag each missing KYC field and state exactly why it is required.
 
 **2. Identity Verification**
-State which documents are required for this customer type, which have been provided, \
-and which are outstanding. Name specific documents (e.g. certificate of incorporation, \
-register of directors, utility bill dated within 3 months, passport copy).
+State which specific documents are required for this customer type, which have been provided, \
+and which are outstanding. Name exact documents (e.g. certificate of incorporation, \
+register of directors, certified passport copy, utility bill dated within 3 months).
 
 **3. Beneficial Ownership**
-Name every identified beneficial owner with percentage stake if known. If the structure \
-is opaque, describe exactly what was found and what remains unknown. Flag nominee \
-arrangements, layered holding structures, or offshore entities with specifics.
+Name every identified beneficial owner with ownership percentage if known. If the structure \
+is opaque, describe exactly what was found and what is missing. Flag nominee arrangements, \
+layered holding structures, or offshore entities with specifics.
 
 **4. Business Relationship Purpose**
 State the exact business activity, expected transaction types, stated volumes \
-(monthly/annual), and declared source of funds or wealth. Flag any inconsistency \
-with the customer's known profile or jurisdiction.
+(monthly/annual), and declared source of funds or wealth. Flag any inconsistency.
 
 **5. Risk Assessment**
-Score EACH of the following with supporting evidence — never leave one unaddressed:
-- Geographic risk (jurisdiction of incorporation, of operations, of UBOs)
+Score EACH factor with supporting evidence — never leave one unaddressed:
+- Geographic risk (jurisdiction of incorporation, of operations, of UBOs — note FATF status)
 - Sector/industry risk
 - PEP exposure (direct or by association)
 - Sanctions exposure
 - Ownership structure complexity
 - Adverse media
-Conclude with a preliminary overall rating (Low / Medium / High) with clear rationale. \
+Conclude with preliminary overall rating (Low / Medium / High) with a clear rationale. \
 Mark as preliminary, requiring analyst validation.
 
 **6. Sanctions and PEP Screening**
-Lead with the Dow Jones R&C screening result. State the exact result for each category: \
-"DJ R&C — [category]: [number of matches / no matches]. [Detail of any match]."
-Then confirm which additional lists were searched manually via web. For any match, provide: \
-full name on list, listing authority, reason for listing, date listed, and DJ profile ID.
+Lead with the OpenSanctions result. For each match: name on list, which specific list(s) \
+it appears on, listing reason, listing date, and entity type. If no matches: state which \
+lists were covered by the search. Then list any supplementary web searches run for \
+specific lists (e.g. direct OFAC search, HMT list check).
 
 **7. Adverse Media**
-List each relevant article or report with: headline, publication, date, URL, and \
-one-sentence summary. Distinguish confirmed facts from allegations. If no adverse \
-media was found after thorough searching, state that explicitly alongside the queries used.
+List each relevant article with: headline, publication, date, URL, and one-sentence summary. \
+Distinguish confirmed facts from allegations. If none found after thorough searching, state \
+that explicitly alongside the queries used.
 
 **8. Enhanced Due Diligence Triggers**
-List each EDD trigger present (e.g. offshore jurisdiction, PEP connection, sanctions \
-match, complex ownership, adverse media, high-risk sector). For each trigger, specify \
-the exact additional documentation or steps required. If no EDD triggers exist, confirm.
+List each EDD trigger present (e.g. offshore jurisdiction, PEP connection, sanctions match, \
+complex ownership, adverse media, FATF high-risk country, cash-intensive sector). For each, \
+specify the exact additional documentation or steps required. If no triggers, confirm explicitly.
 
 **9. CDD Case Narrative**
 Write at least four paragraphs:
 (1) Who the customer is and what they do.
 (2) Key risk factors identified.
 (3) How each risk was assessed or mitigated by the research.
-(4) Recommended decision with justification — Approve / Decline / Escalate for further review.
+(4) Recommended decision with justification — Approve / Decline / Escalate.
 Label: ⚠️ DRAFT — Pending Analyst Review.
 
 **10. Ongoing Monitoring Notes**
-State a specific review frequency (e.g. 6-monthly) with justification. List at least \
-three specific transaction types or behavioural patterns to flag for this customer.
+State a specific review frequency with justification. List at least three specific \
+transaction types or behavioural patterns to flag for this customer.
 
 GENERAL RULES:
-- Every factual claim must cite its source URL or state "source: Dow Jones R&C" or "provided by analyst".
-- If dow_jones_screen returns a "not configured" message, note this prominently in Section 6 \
-  and confirm that web-based screening was used as an alternative.
-- Never fabricate data or infer ownership without evidence.
+- Every factual claim must cite a source URL or state "source: OpenSanctions" / "provided by analyst".
 - Never write "further investigation may be needed" without specifying exactly what.
+- Never fabricate data or infer ownership without evidence.
 - Use professional language appropriate for a compliance case file.\
 """
 
 TOOLS = [
     {
-        "name": "dow_jones_screen",
+        "name": "sanctions_screen",
         "description": (
-            "Screen a name against the Dow Jones Risk & Compliance database. "
-            "This is the primary professional screening tool — ALWAYS call this first. "
-            "It covers 1,000+ global sanctions lists (OFAC, UN, EU, HMT and more), "
-            "PEP lists, state-owned enterprises, and curated adverse media. "
-            "Call once for the entity name and, if relevant, once more for key individuals."
+            "Screen a name against the OpenSanctions database — 100+ global sanctions lists "
+            "(OFAC SDN, UN, EU, HMT, DFAT, SECO, and more) plus PEP lists and enforcement "
+            "actions. No account needed. ALWAYS call this first for any name being reviewed. "
+            "Call once for the entity, then separately for each known director or UBO."
         ),
         "input_schema": {
             "type": "object",
@@ -143,15 +128,7 @@ TOOLS = [
                 "name": {
                     "type": "string",
                     "description": "Full name of the person or company to screen.",
-                },
-                "entity_type": {
-                    "type": "string",
-                    "enum": ["PERSON", "COMPANY", "ALL"],
-                    "description": (
-                        "Type of entity. Use PERSON for individuals, COMPANY for businesses, "
-                        "ALL if unsure."
-                    ),
-                },
+                }
             },
             "required": ["name"],
         },
@@ -160,7 +137,7 @@ TOOLS = [
         "name": "web_search",
         "description": (
             "Search the internet for information relevant to a CDD review. "
-            "Use this to supplement Dow Jones screening with registry data, recent news, "
+            "Use to supplement sanctions screening with registry data, adverse media, "
             "and ownership details. Each call should focus on one specific aspect. "
             "After getting results, use fetch_webpage on the most relevant URLs."
         ),
@@ -216,109 +193,84 @@ def get_client() -> Anthropic:
     return Anthropic(api_key=api_key)
 
 
-def _dj_bearer_token() -> str | None:
-    """Obtain a DJ OAuth2 bearer token from client credentials, if configured."""
-    client_id = st.secrets.get("DOWJONES_CLIENT_ID") or os.getenv("DOWJONES_CLIENT_ID")
-    client_secret = st.secrets.get("DOWJONES_CLIENT_SECRET") or os.getenv("DOWJONES_CLIENT_SECRET")
-    if not (client_id and client_secret):
-        return None
+def sanctions_screen(name: str) -> str:
+    """
+    Screen a name against the OpenSanctions database.
+    Covers OFAC SDN, UN, EU, HMT, DFAT, SECO, 100+ other lists, PEPs, and enforcement actions.
+    Free public API — no account needed.
+    """
     try:
-        resp = requests.post(
-            DJ_TOKEN_URL,
-            data={
-                "grant_type": "client_credentials",
-                "client_id": client_id,
-                "client_secret": client_secret,
-            },
-            timeout=10,
+        resp = requests.get(
+            OPENSANCTIONS_URL,
+            params={"q": name, "limit": 20},
+            headers={"Accept": "application/json"},
+            timeout=15,
         )
-        resp.raise_for_status()
-        return resp.json().get("access_token")
-    except Exception:
-        return None
-
-
-def dow_jones_screen(name: str, entity_type: str = "ALL") -> str:
-    """Screen a name against the Dow Jones Risk & Compliance database."""
-    # Resolve credentials: prefer direct API key, then OAuth2
-    api_key = st.secrets.get("DOWJONES_API_KEY") or os.getenv("DOWJONES_API_KEY")
-    token = api_key or _dj_bearer_token()
-
-    if not token:
-        return (
-            "⚠️ Dow Jones Risk & Compliance: Not configured.\n"
-            "To enable professional screening add to app secrets:\n"
-            "  DOWJONES_API_KEY = \"your-key\"  (API key auth)\n"
-            "  — or —\n"
-            "  DOWJONES_CLIENT_ID = \"...\"\n"
-            "  DOWJONES_CLIENT_SECRET = \"...\"\n"
-            "Web-based sanctions and PEP searching will be used as an alternative."
-        )
-
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "data": {
-            "attributes": {
-                "filter_search_string": name,
-                "filter_entity_type": entity_type,
-                "search_type": "CONTAINS",
-                "page_size": 25,
-                "filter_content_category": DJ_CATEGORIES,
-            }
-        }
-    }
-
-    try:
-        resp = requests.post(DJ_SCREEN_URL, headers=headers, json=payload, timeout=20)
         resp.raise_for_status()
         data = resp.json()
 
-        profiles = data.get("data", [])
-        meta = data.get("meta", {})
-        total = meta.get("total_count", len(profiles))
+        results = data.get("results", [])
+        total = data.get("total", {}).get("value", 0)
 
-        if not profiles:
+        if not results:
             return (
-                f"Dow Jones R&C screening for '{name}' ({entity_type}): "
-                f"No matches found across PEP, sanctions (OFAC/UN/EU/HMT/others), "
-                f"SOE, and adverse media categories."
+                f"OpenSanctions screening for '{name}': No matches found.\n"
+                f"Lists checked include: OFAC SDN, OFAC Non-SDN Consolidated, "
+                f"UN Security Council, EU Financial Sanctions, HMT UK, DFAT Australia, "
+                f"SECO Switzerland, OSFI Canada, and 100+ additional global lists, "
+                f"plus PEP and enforcement action datasets."
             )
 
         lines = [
-            f"Dow Jones R&C — {total} potential match(es) for '{name}' ({entity_type}):\n"
+            f"OpenSanctions — {total} potential match(es) for '{name}':\n"
+            f"(Covers OFAC, UN, EU, HMT, DFAT, SECO, 100+ lists + PEP data)\n"
         ]
-        for p in profiles[:15]:
-            attrs = p.get("attributes", {})
-            categories = attrs.get("categories", [])
-            score = attrs.get("score", "N/A")
-            primary = attrs.get("primary_name", "N/A")
-            ptype = attrs.get("entity_type", "N/A")
-            profile_id = p.get("id", "N/A")
-            also_known = attrs.get("also_known_as", [])
+        for r in results[:12]:
+            props = r.get("properties", {})
+            datasets = r.get("datasets", [])
+            schema = r.get("schema", "Unknown")
+            score = round(r.get("score", 0), 2)
 
-            lines.append(
-                f"  Profile ID : {profile_id}\n"
-                f"  Name       : {primary}\n"
-                f"  Type       : {ptype}\n"
-                f"  Categories : {', '.join(categories) if categories else 'N/A'}\n"
+            aliases = props.get("alias", [])
+            birth_dates = props.get("birthDate", [])
+            nationality = props.get("nationality", [])
+            countries = props.get("country", [])
+            topics = props.get("topics", [])
+            # Sanctions-specific fields
+            listing_date = props.get("listingDate", [])
+            reason = props.get("reason", []) or props.get("notes", [])
+
+            entry = (
+                f"  Name       : {r.get('caption', 'N/A')}\n"
+                f"  Type       : {schema}\n"
                 f"  Match score: {score}\n"
-                + (f"  AKAs       : {', '.join(also_known[:5])}\n" if also_known else "")
+                f"  Lists      : {', '.join(datasets[:10])}\n"
             )
+            if topics:
+                entry += f"  Topics     : {', '.join(topics)}\n"
+            if aliases:
+                entry += f"  AKAs       : {', '.join(aliases[:5])}\n"
+            if birth_dates:
+                entry += f"  DOB        : {', '.join(birth_dates)}\n"
+            if nationality:
+                entry += f"  Nationality: {', '.join(nationality)}\n"
+            if countries:
+                entry += f"  Countries  : {', '.join(countries)}\n"
+            if listing_date:
+                entry += f"  Listed     : {', '.join(listing_date)}\n"
+            if reason:
+                entry += f"  Reason     : {' '.join(reason)[:300]}\n"
+            lines.append(entry)
 
-        if total > 15:
-            lines.append(f"  ... and {total - 15} more. Refine search for full list.")
+        if total > 12:
+            lines.append(f"  ... {total - 12} more result(s). Consider narrowing the name.")
 
         return "\n".join(lines)
 
     except requests.HTTPError as exc:
-        code = exc.response.status_code
-        body = exc.response.text[:400]
-        return f"Dow Jones API error (HTTP {code}): {body}"
+        return f"OpenSanctions API error (HTTP {exc.response.status_code}): {exc.response.text[:300]}"
     except Exception as exc:
-        return f"Dow Jones API error: {exc}"
+        return f"OpenSanctions screening error: {exc}"
 
 
 def run_web_search(query: str, max_results: int = 8) -> str:
@@ -350,7 +302,7 @@ def fetch_webpage(url: str, max_chars: int = 4000) -> str:
         for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
             tag.decompose()
         text = soup.get_text(separator="\n", strip=True)
-        lines = [l for l in text.splitlines() if l.strip()]
+        lines = [ln for ln in text.splitlines() if ln.strip()]
         text = "\n".join(lines)
         return text[:max_chars] + ("\n\n[Page truncated]" if len(text) > max_chars else "")
     except Exception as exc:
@@ -359,7 +311,7 @@ def fetch_webpage(url: str, max_chars: int = 4000) -> str:
 
 def run_cdd_research(client: Anthropic, subject: str, context: str, status_box):
     """
-    Agentic loop: Claude screens via DJ R&C, searches the web, and reads pages,
+    Agentic loop: Claude screens via OpenSanctions, searches the web, and reads pages,
     then synthesises results into a full CDD report.
     Returns (report_text, list_of_actions).
     """
@@ -403,12 +355,11 @@ def run_cdd_research(client: Anthropic, subject: str, context: str, status_box):
 
                     tool_call_count += 1
 
-                    if block.name == "dow_jones_screen":
+                    if block.name == "sanctions_screen":
                         name = block.input["name"]
-                        etype = block.input.get("entity_type", "ALL")
-                        actions_done.append(f"🛡️ DJ R&C: {name} ({etype})")
-                        progress.info(f"Dow Jones screening: *{name}*")
-                        result = dow_jones_screen(name, etype)
+                        actions_done.append(f"🛡️ Sanctions: {name}")
+                        progress.info(f"Sanctions & PEP screening: *{name}*")
+                        result = sanctions_screen(name)
 
                     elif block.name == "web_search":
                         query = block.input["query"]
@@ -446,18 +397,6 @@ def run_cdd_research(client: Anthropic, subject: str, context: str, status_box):
         return report, actions_done
 
 
-def dj_configured() -> bool:
-    """Return True if Dow Jones credentials are available."""
-    return bool(
-        st.secrets.get("DOWJONES_API_KEY")
-        or os.getenv("DOWJONES_API_KEY")
-        or (
-            (st.secrets.get("DOWJONES_CLIENT_ID") or os.getenv("DOWJONES_CLIENT_ID"))
-            and (st.secrets.get("DOWJONES_CLIENT_SECRET") or os.getenv("DOWJONES_CLIENT_SECRET"))
-        )
-    )
-
-
 def init_session_state():
     for key, default in [
         ("report", None),
@@ -487,19 +426,12 @@ def main():
         st.caption("AI-Assisted Customer Due Diligence")
         st.divider()
 
-        # DJ R&C status indicator
-        if dj_configured():
-            st.success("🛡️ Dow Jones R&C connected")
-        else:
-            st.warning(
-                "🛡️ **Dow Jones R&C not configured**\n\n"
-                "Add credentials to Secrets to enable professional screening:\n"
-                "```\nDOWJONES_API_KEY = \"your-key\"\n```\n"
-                "or\n"
-                "```\nDOWJONES_CLIENT_ID = \"...\"\n"
-                "DOWJONES_CLIENT_SECRET = \"...\"\n```\n"
-                "Web-based screening will be used instead."
-            )
+        st.info(
+            "🛡️ **Sanctions & PEP screening**\n\n"
+            "Powered by [OpenSanctions](https://opensanctions.org) — "
+            "covers OFAC, UN, EU, HMT, DFAT, SECO, and 100+ other global lists, "
+            "plus PEP and enforcement action data. No account required."
+        )
 
         st.divider()
 
@@ -509,8 +441,8 @@ def main():
                 1. Type any **name or company name** in the search box
                 2. Optionally add context (jurisdiction, relationship type, etc.)
                 3. Click **Run CDD Review**
-                4. The AI runs Dow Jones R&C screening, web searches,
-                   and reads relevant pages automatically
+                4. The AI automatically screens against 100+ sanctions and PEP
+                   lists, searches the web, and reads relevant pages
                 5. Review the structured report
                 6. Use the chat below for follow-up questions
                 7. Download the report for your case file
@@ -552,8 +484,7 @@ def main():
         with st.form("cdd_form"):
             subject = st.text_input(
                 "Name or company name",
-                placeholder="e.g. Meridian Trading Ltd  or  John Smith",
-                label_visibility="visible",
+                placeholder="e.g.  Meridian Trading Ltd     or     John Smith",
             )
 
             with st.expander("Optional: additional context"):
@@ -588,11 +519,11 @@ def main():
     # ── Report display ─────────────────────────────────────────────────────────
     if st.session_state.report:
         if st.session_state.searches:
-            dj_count = sum(1 for a in st.session_state.searches if a.startswith("🛡️"))
+            screen_count = sum(1 for a in st.session_state.searches if a.startswith("🛡️"))
             web_count = sum(1 for a in st.session_state.searches if a.startswith("🔍"))
             page_count = sum(1 for a in st.session_state.searches if a.startswith("📄"))
             with st.expander(
-                f"Research performed: {dj_count} DJ screening · "
+                f"Research performed: {screen_count} sanctions screening · "
                 f"{web_count} web searches · {page_count} pages read",
                 expanded=False,
             ):
