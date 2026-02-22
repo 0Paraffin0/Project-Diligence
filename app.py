@@ -6,8 +6,10 @@ a structured CDD report ready for analyst review.
 
 import os
 
+import requests
 import streamlit as st
 from anthropic import Anthropic
+from bs4 import BeautifulSoup
 from duckduckgo_search import DDGS
 from dotenv import load_dotenv
 
@@ -15,42 +17,91 @@ load_dotenv()
 
 MODEL = "claude-opus-4-6"
 MAX_TOKENS = 16000
-MAX_SEARCHES = 10  # cap to prevent runaway loops
+MAX_TOOL_CALLS = 20  # cap to prevent runaway loops
 
 SYSTEM_PROMPT = """\
 You are an expert financial crime compliance assistant specialising in Customer Due Diligence (CDD).
 
-You have access to a web_search tool. When given a customer to review, proactively search the \
-internet to gather information across all relevant CDD risk areas before writing your report.
+You have two research tools: web_search and fetch_webpage. Use both extensively before writing \
+the report. Snippets alone are rarely enough — after finding a relevant URL, use fetch_webpage \
+to read the full content of the page.
 
-Run multiple targeted searches — at minimum cover:
-- Company or individual registration and ownership structure
-- Sanctions exposure (OFAC, UN, EU, HMT)
-- PEP (Politically Exposed Person) status
-- Adverse media: fraud, money laundering, bribery, regulatory actions
-- General background and business activities
+RESEARCH REQUIREMENTS — run AT LEAST 10 tool calls covering:
+1. Company/individual registration: "[name] company registration [country]", "[name] registered address director"
+2. Sanctions — search each list separately:
+   - "[name] OFAC SDN sanctions"
+   - "[name] UN consolidated sanctions list"
+   - "[name] EU sanctions list"
+   - "[name] HMT UK financial sanctions"
+3. PEP status: "[name] politically exposed person government official"
+4. Adverse media: "[name] fraud", "[name] money laundering", "[name] bribery corruption", \
+"[name] criminal investigation regulatory action"
+5. Ownership structure: "[name] beneficial owner shareholder UBO"
+6. General background: "[name] business activities revenue clients"
 
-After completing your research, produce a structured report with all 10 sections:
+After each search, fetch the full content of the 1–2 most relevant URLs using fetch_webpage.
 
-1. Customer Identification — summarise known identifying details; flag missing KYC fields
-2. Identity Verification — note what has been verified and what is outstanding
-3. Beneficial Ownership — map owners above 25% threshold; flag complex or offshore structures
-4. Business Relationship Purpose — summarise stated purpose, expected volumes, source of funds
-5. Risk Assessment — preliminary rating (Low / Medium / High) with evidence; do not finalise
-6. Sanctions and PEP Screening — flag any list matches with supporting detail
-7. Adverse Media — summarise findings; distinguish confirmed facts from unverified allegations
-8. Enhanced Due Diligence Triggers — recommend EDD steps if high-risk indicators are present
-9. CDD Case Narrative — draft summary and recommended decision (Approve / Decline / Escalate)
-10. Ongoing Monitoring Notes — recommended review frequency and behaviours to monitor
+REPORT REQUIREMENTS — every section must be specific and evidence-based:
 
-Behavioural guidelines:
-- Cite the source URL for every finding.
-- Clearly state when a search returned no relevant results.
+**1. Customer Identification**
+List every piece of identifying information found: full legal name, registration number, \
+registered address, incorporation date, jurisdiction, directors, company type. \
+Explicitly flag each missing KYC field and why it is required.
+
+**2. Identity Verification**
+State exactly which documents are needed for this customer type, which have been provided, \
+and which are outstanding. Do not be vague — name the specific documents.
+
+**3. Beneficial Ownership**
+Name every identified beneficial owner with ownership percentage if known. If the structure \
+is opaque, describe exactly what is known and what is missing. Flag nominee arrangements, \
+layered structures, or offshore holding companies with specifics.
+
+**4. Business Relationship Purpose**
+State the exact business activity, specific transaction types expected, stated monthly/annual \
+volumes, and declared source of funds or wealth. Flag any inconsistency with the customer profile.
+
+**5. Risk Assessment**
+Score EACH of the following factors with supporting evidence — never leave one unaddressed:
+- Geographic risk (jurisdiction of incorporation, operation, and UBOs)
+- Sector/industry risk
+- PEP exposure
+- Sanctions exposure
+- Ownership complexity
+- Adverse media
+Conclude with preliminary overall rating (Low / Medium / High) with a clear rationale. \
+State this is preliminary and requires analyst validation.
+
+**6. Sanctions and PEP Screening**
+State explicitly which lists were checked. For each: "Searched [list] — [result]." \
+If a potential match is found, provide the full name, listing reason, and date listed. \
+Do not summarise — be exact.
+
+**7. Adverse Media**
+List each relevant article or report with: headline, publication, date, URL, and a \
+one-sentence summary. Distinguish confirmed findings from allegations. If no adverse \
+media was found after thorough searching, state that explicitly with the queries used.
+
+**8. Enhanced Due Diligence Triggers**
+List each trigger present (e.g. offshore jurisdiction, complex ownership, adverse media hit, \
+PEP connection). For each trigger, specify the exact additional documentation or steps required. \
+If no EDD triggers are present, state this explicitly.
+
+**9. CDD Case Narrative**
+Write at least four paragraphs: (1) who the customer is, (2) key risk factors found, \
+(3) how each risk was assessed or mitigated, (4) recommended decision with justification \
+(Approve / Decline / Escalate for further review). Label as DRAFT pending analyst review.
+
+**10. Ongoing Monitoring Notes**
+State a specific review frequency (e.g. 6-monthly, annual) with justification. List at \
+least three specific transaction types or behavioural patterns to flag for this customer.
+
+GENERAL RULES:
+- Every factual claim must cite a source URL or state "provided by analyst".
+- Never write "further investigation may be required" without specifying exactly what.
 - Never fabricate data or infer ownership without evidence.
-- Flag anything unusual or potentially high-risk.
-- Use plain, professional language suitable for a compliance case file.
-- Label the full report as a DRAFT pending analyst review.
-- Always remind the analyst that final decisions are their responsibility.\
+- Use professional language appropriate for a compliance case file.
+- Label the entire output: ⚠️ DRAFT — Pending Analyst Review.\
 """
 
 TOOLS = [
@@ -58,9 +109,9 @@ TOOLS = [
         "name": "web_search",
         "description": (
             "Search the internet for information relevant to a CDD review. "
-            "Run multiple specific searches to cover sanctions lists, adverse media, "
-            "corporate registry data, PEP status, and general background. "
-            "Each call should focus on one specific aspect."
+            "Run multiple specific searches covering sanctions, adverse media, company "
+            "registries, PEP status, and background. Each call should focus on one aspect. "
+            "After getting results, use fetch_webpage on the most relevant URLs."
         ),
         "input_schema": {
             "type": "object",
@@ -69,13 +120,31 @@ TOOLS = [
                     "type": "string",
                     "description": (
                         "A specific search query, e.g. 'Acme Holdings BVI company registry', "
-                        "'John Smith OFAC sanctions', 'Meridian Trading fraud news 2024'"
+                        "'John Smith OFAC sanctions', 'Meridian Trading fraud 2023'"
                     ),
                 }
             },
             "required": ["query"],
         },
-    }
+    },
+    {
+        "name": "fetch_webpage",
+        "description": (
+            "Fetch the full text content of a specific webpage. Use this after web_search "
+            "to read full articles, company registry entries, sanctions list pages, or news "
+            "reports. Much more detailed than search snippets."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The full URL of the webpage to fetch and read.",
+                }
+            },
+            "required": ["url"],
+        },
+    },
 ]
 
 
@@ -96,7 +165,7 @@ def get_client() -> Anthropic:
     return Anthropic(api_key=api_key)
 
 
-def run_web_search(query: str, max_results: int = 5) -> str:
+def run_web_search(query: str, max_results: int = 8) -> str:
     """Execute a DuckDuckGo search and return formatted results."""
     try:
         with DDGS() as ddgs:
@@ -115,22 +184,40 @@ def run_web_search(query: str, max_results: int = 5) -> str:
         return f"Search error: {exc}"
 
 
+def fetch_webpage(url: str, max_chars: int = 4000) -> str:
+    """Fetch and extract the main text content from a webpage."""
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; CDD-Research/1.0)"}
+        resp = requests.get(url, timeout=12, headers=headers)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+            tag.decompose()
+        text = soup.get_text(separator="\n", strip=True)
+        # Collapse excessive blank lines
+        lines = [l for l in text.splitlines() if l.strip()]
+        text = "\n".join(lines)
+        return text[:max_chars] + ("\n\n[Page truncated]" if len(text) > max_chars else "")
+    except Exception as exc:
+        return f"Could not fetch page: {exc}"
+
+
 def run_cdd_research(client: Anthropic, customer_details: str, status_box):
     """
-    Agentic loop: Claude decides what to search, we execute,
+    Agentic loop: Claude decides what to search and fetch, we execute,
     Claude synthesises results into a CDD report.
-    Returns (report_text, list_of_queries).
+    Returns (report_text, list_of_actions).
     """
     messages = [{"role": "user", "content": customer_details}]
-    search_count = 0
-    searches_done = []
+    tool_call_count = 0
+    actions_done = []
 
     with status_box:
         progress = st.empty()
         log = st.empty()
 
-        while search_count <= MAX_SEARCHES:
-            progress.info("Thinking about what to research…")
+        while tool_call_count <= MAX_TOOL_CALLS:
+            progress.info("Analysing findings…")
 
             response = client.messages.create(
                 model=MODEL,
@@ -145,39 +232,53 @@ def run_cdd_research(client: Anthropic, customer_details: str, status_box):
                 report = next(
                     (b.text for b in response.content if b.type == "text"), ""
                 )
-                return report, searches_done
+                return report, actions_done
 
             if response.stop_reason == "tool_use":
                 messages.append({"role": "assistant", "content": response.content})
                 tool_results = []
 
                 for block in response.content:
-                    if block.type == "tool_use" and block.name == "web_search":
+                    if block.type != "tool_use":
+                        continue
+
+                    tool_call_count += 1
+
+                    if block.name == "web_search":
                         query = block.input["query"]
-                        search_count += 1
-                        searches_done.append(query)
-                        progress.info(f"Searching ({search_count}): *{query}*")
-                        log.markdown(
-                            "**Searches so far:**\n"
-                            + "\n".join(f"- {q}" for q in searches_done)
-                        )
+                        actions_done.append(f"🔍 {query}")
+                        progress.info(f"Searching: *{query}*")
                         result = run_web_search(query)
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": result,
-                        })
+
+                    elif block.name == "fetch_webpage":
+                        url = block.input["url"]
+                        actions_done.append(f"📄 {url}")
+                        progress.info(f"Reading page: *{url[:80]}*")
+                        result = fetch_webpage(url)
+
+                    else:
+                        result = "Unknown tool."
+
+                    log.markdown(
+                        "**Research activity:**\n"
+                        + "\n".join(f"- {a}" for a in actions_done[-10:])
+                    )
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": result,
+                    })
 
                 messages.append({"role": "user", "content": tool_results})
             else:
                 break
 
-        # Fallback if loop exits without end_turn
+        # Fallback if loop hits the cap
         report = next(
             (b.text for b in response.content if b.type == "text"),
-            "Research reached the search limit. Please review findings above.",
+            "Research reached the activity limit. Please review findings above.",
         )
-        return report, searches_done
+        return report, actions_done
 
 
 def init_session_state():
@@ -289,7 +390,7 @@ def main():
     if st.session_state.report:
         if st.session_state.searches:
             with st.expander(
-                f"🔍 {len(st.session_state.searches)} web searches performed",
+                f"🔍 {len(st.session_state.searches)} research actions performed",
                 expanded=False,
             ):
                 for q in st.session_state.searches:
