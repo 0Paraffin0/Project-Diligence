@@ -87,14 +87,15 @@ Behavioural guidelines:
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def get_client() -> Anthropic:
-    """Initialise the Anthropic client from environment variable."""
-    api_key = os.getenv("ANTHROPIC_API_KEY")
+    """Initialise the Anthropic client, checking st.secrets then environment variables."""
+    api_key = st.secrets.get("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
         st.error(
             "**ANTHROPIC_API_KEY not found.**\n\n"
-            "Create a file called `.env` in the same folder as `app.py` and add:\n"
-            "```\nANTHROPIC_API_KEY=your-api-key-here\n```\n"
-            "Then restart the app with `streamlit run app.py`."
+            "**On Streamlit Cloud:** go to your app's Settings → Secrets and add:\n"
+            "```\nANTHROPIC_API_KEY = \"your-api-key-here\"\n```\n"
+            "**Running locally:** create a `.env` file next to `app.py` and add:\n"
+            "```\nANTHROPIC_API_KEY=your-api-key-here\n```"
         )
         st.stop()
     return Anthropic(api_key=api_key)
